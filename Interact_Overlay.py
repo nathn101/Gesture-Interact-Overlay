@@ -44,7 +44,8 @@ class TrackingThread(QThread):
         super().__init__()
         self.mouse = Controller()
         self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(min_detection_confidence=0.8, min_tracking_confidence=0.8)
+        self.hands = self.mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.8, min_tracking_confidence=0.8)
+        self.prev_wrist = None
         self.cap = cv2.VideoCapture(0)
         self.running = True
         
@@ -53,6 +54,7 @@ class TrackingThread(QThread):
         self.should_calibrate = False
         self.is_clicked = False
         self.is_right_clicked = False
+        self.is_tracking_paused = False
         self.origin_cx, self.origin_cy = 0.5, 0.5
         self.sensitivity = 1.5
         
@@ -80,7 +82,32 @@ class TrackingThread(QThread):
             lms_out, is_scrolling, px, py = [], False, 0.5, 0.5
 
             if results.multi_hand_landmarks:
-                lms = results.multi_hand_landmarks[0].landmark
+                best_hand_lms = None
+                max_score = -1
+                
+                for hand_landmarks in results.multi_hand_landmarks:
+                    lms_eval = hand_landmarks.landmark
+                    
+                    # Calculate openness score (number of fingers extended)
+                    fingers_up = 0
+                    if lms_eval[8].y < lms_eval[6].y: fingers_up += 1
+                    if lms_eval[12].y < lms_eval[10].y: fingers_up += 1
+                    if lms_eval[16].y < lms_eval[14].y: fingers_up += 1
+                    if lms_eval[20].y < lms_eval[18].y: fingers_up += 1
+                    
+                    score = fingers_up * 10.0
+                    
+                    # Apply historical hysteresis bias to prevent flickering between two equally open hands
+                    if self.prev_wrist and np.hypot(lms_eval[0].x - self.prev_wrist[0], lms_eval[0].y - self.prev_wrist[1]) < 0.3:
+                        score += 5.0
+                        
+                    if score > max_score:
+                        max_score = score
+                        best_hand_lms = lms_eval
+                
+                # Funnel the dominant active hand directly into the application pipeline
+                lms = best_hand_lms
+                self.prev_wrist = (lms[0].x, lms[0].y)
                 
                 # Finger States
                 index_up = lms[8].y < lms[5].y
@@ -113,10 +140,20 @@ class TrackingThread(QThread):
                 else:
                     self.prev_scroll_y = 0
 
-                is_switching = False
+                # 3. Movement and Pause Logic
+                fingers_extended = sum([index_up, middle_up, ring_up, pinky_up])
+                
+                if fingers_extended <= 0:
+                    self.is_tracking_paused = True
+                elif fingers_extended >= 4:
+                    if self.is_tracking_paused:
+                        # Re-anchor tracking immediately to where the hand is physically located to prevent jumping
+                        self.origin_cx, self.origin_cy = palm_x, palm_y
+                        mx, my = self.mouse.position
+                        self.physical_center_x, self.physical_center_y = mx, my
+                    self.is_tracking_paused = False
 
-                # 3. Movement (Only if not scrolling)
-                if self.is_calibrated and not is_scrolling:
+                if self.is_calibrated and not is_scrolling and not self.is_tracking_paused:
                     offset_x = (palm_x - self.origin_cx) * self.sensitivity
                     offset_y = (palm_y - self.origin_cy) * self.sensitivity
                     
@@ -136,7 +173,7 @@ class TrackingThread(QThread):
                 # 5. Clicking
                 dist_left = np.hypot(lms[8].x - lms[4].x, lms[8].y - lms[4].y)
                 is_left_clicked = dist_left < 0.04
-                if is_left_clicked and not self.is_clicked:
+                if is_left_clicked and not self.is_clicked and not self.is_tracking_paused:
                     self.mouse.press(Button.left)
                     self.is_clicked = True
                 elif not is_left_clicked and self.is_clicked:
@@ -145,7 +182,7 @@ class TrackingThread(QThread):
                     
                 dist_right = np.hypot(lms[12].x - lms[4].x, lms[12].y - lms[4].y)
                 is_right_clicked = dist_right < 0.04
-                if is_right_clicked and not self.is_right_clicked:
+                if is_right_clicked and not self.is_right_clicked and not self.is_tracking_paused:
                     self.mouse.press(Button.right)
                     self.is_right_clicked = True
                 elif not is_right_clicked and self.is_right_clicked:
@@ -160,7 +197,7 @@ class TrackingThread(QThread):
                 
                 # Emit any active clicking state to turn the UI red
                 any_clicked = self.is_clicked or self.is_right_clicked
-                self.data_signal.emit(list(lms), logical_pos.x(), logical_pos.y(), any_clicked, is_scrolling, self.is_calibrated, is_switching)
+                self.data_signal.emit(list(lms), logical_pos.x(), logical_pos.y(), any_clicked, is_scrolling, self.is_calibrated, self.is_tracking_paused)
             
             time.sleep(0.01)
 
@@ -184,9 +221,9 @@ class ScreenOverlay(QMainWindow):
         self.is_calibrated = False
         self.show()
 
-    def update_frame(self, lms, mx, my, clicked, scrolling, calibrated, switching):
+    def update_frame(self, lms, mx, my, clicked, scrolling, calibrated, is_paused):
         self.is_calibrated = calibrated
-        self.show_jump_msg = switching
+        self.is_paused = is_paused
         
         # Focus Logic: Only draw hand if mouse is on THIS screen
         if lms and self.geometry().contains(mx, my):
@@ -202,7 +239,8 @@ class ScreenOverlay(QMainWindow):
             
             self.hand_points = [(int(lm.x * self.width() + shift_x), int(lm.y * self.height() + shift_y)) for lm in lms]
             
-            if clicked: self.mode_color = QColor(255, 0, 0, 180)
+            if getattr(self, 'is_paused', False): self.mode_color = QColor(100, 100, 100, 180)
+            elif clicked: self.mode_color = QColor(255, 0, 0, 180)
             elif scrolling: self.mode_color = QColor(255, 255, 0, 180)
             else: self.mode_color = QColor(0, 255, 255, 120)
         else:
@@ -217,6 +255,9 @@ class ScreenOverlay(QMainWindow):
         if not self.is_calibrated:
             painter.setPen(QColor(255, 255, 255, 200))
             painter.drawText(30, 50, "❌ NOT CALIBRATED - Press 'ESC'")
+        elif getattr(self, 'is_paused', False):
+            painter.setPen(QColor(255, 255, 255, 200))
+            painter.drawText(30, 50, "⏸ PAUSED - Open Palm to Resume")
         
         # Draw Ghost Hand (only if hand_points list is populated by the focused check)
         if self.hand_points:
