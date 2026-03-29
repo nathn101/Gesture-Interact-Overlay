@@ -55,8 +55,9 @@ class TrackingThread(QThread):
         self.is_clicked = False
         self.is_right_clicked = False
         self.is_tracking_paused = False
+        self.click_freeze_time = 0.0
         self.origin_cx, self.origin_cy = 0.5, 0.5
-        self.sensitivity = 1.5
+        self.sensitivity = 3
         
         self.physical_center_x, self.physical_center_y = 0, 0
         self.current_screen_idx = 0
@@ -115,6 +116,10 @@ class TrackingThread(QThread):
                 ring_up = lms[16].y < lms[13].y
                 pinky_up = lms[20].y < lms[17].y
                 
+                # Check for "Shaka" gesture (Thumb and Pinky out, others curled)
+                thumb_out = np.hypot(lms[4].x - lms[17].x, lms[4].y - lms[17].y) > 0.12 # Thumb tip far from pinky knuckle
+                is_shaka = thumb_out and pinky_up and not index_up and not middle_up and not ring_up
+                
                 # Palm Centroid
                 palm_x = (lms[0].x + lms[5].x + lms[17].x) / 3
                 palm_y = (lms[0].y + lms[5].y + lms[17].y) / 3
@@ -142,18 +147,21 @@ class TrackingThread(QThread):
 
                 # 3. Movement and Pause Logic
                 fingers_extended = sum([index_up, middle_up, ring_up, pinky_up])
+                is_click_frozen = (time.time() - self.click_freeze_time) < 0.25
                 
-                if fingers_extended <= 0:
-                    self.is_tracking_paused = True
-                elif fingers_extended >= 4:
-                    if self.is_tracking_paused:
-                        # Re-anchor tracking immediately to where the hand is physically located to prevent jumping
-                        self.origin_cx, self.origin_cy = palm_x, palm_y
-                        mx, my = self.mouse.position
-                        self.physical_center_x, self.physical_center_y = mx, my
-                    self.is_tracking_paused = False
+                # Toggle tracking entirely with the thumb and pinky extended gesture (Shaka)
+                if is_shaka:
+                    if time.time() - getattr(self, 'last_pause_toggle_time', 0.0) > 1.0:
+                        self.is_tracking_paused = not self.is_tracking_paused
+                        self.last_pause_toggle_time = time.time()
 
-                if self.is_calibrated and not is_scrolling and not self.is_tracking_paused:
+                if self.is_tracking_paused or is_click_frozen:
+                    # Dynamically re-anchor the palm to discard jitter and movement while paused/frozen
+                    self.origin_cx, self.origin_cy = palm_x, palm_y
+                    mx, my = self.mouse.position
+                    self.physical_center_x, self.physical_center_y = mx, my
+
+                if self.is_calibrated and not is_scrolling and not self.is_tracking_paused and not is_click_frozen:
                     offset_x = (palm_x - self.origin_cx) * self.sensitivity
                     offset_y = (palm_y - self.origin_cy) * self.sensitivity
                     
@@ -176,18 +184,22 @@ class TrackingThread(QThread):
                 if is_left_clicked and not self.is_clicked and not self.is_tracking_paused:
                     self.mouse.press(Button.left)
                     self.is_clicked = True
+                    self.click_freeze_time = time.time()
                 elif not is_left_clicked and self.is_clicked:
                     self.mouse.release(Button.left)
                     self.is_clicked = False
+                    self.click_freeze_time = time.time()
                     
                 dist_right = np.hypot(lms[12].x - lms[4].x, lms[12].y - lms[4].y)
                 is_right_clicked = dist_right < 0.04
                 if is_right_clicked and not self.is_right_clicked and not self.is_tracking_paused:
                     self.mouse.press(Button.right)
                     self.is_right_clicked = True
+                    self.click_freeze_time = time.time()
                 elif not is_right_clicked and self.is_right_clicked:
                     self.mouse.release(Button.right)
                     self.is_right_clicked = False
+                    self.click_freeze_time = time.time()
                     
                 mx, my = self.mouse.position
                 
@@ -204,8 +216,6 @@ class TrackingThread(QThread):
         # Cleanly release the camera and mediapipe resources on exit
         self.cap.release()
         self.hands.close()
-
-
 
 # Individual Overlay Window
 class ScreenOverlay(QMainWindow):
@@ -257,7 +267,7 @@ class ScreenOverlay(QMainWindow):
             painter.drawText(30, 50, "❌ NOT CALIBRATED - Press 'ESC'")
         elif getattr(self, 'is_paused', False):
             painter.setPen(QColor(255, 255, 255, 200))
-            painter.drawText(30, 50, "⏸ PAUSED - Open Palm to Resume")
+            painter.drawText(30, 50, "⏸ PAUSED - Thumb & Pinky (Shaka) to Resume")
         
         # Draw Ghost Hand (only if hand_points list is populated by the focused check)
         if self.hand_points:
